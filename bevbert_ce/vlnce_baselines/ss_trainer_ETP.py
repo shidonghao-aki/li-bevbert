@@ -590,6 +590,7 @@ class RLTrainer(BaseVLNCETrainer):
         else:
             eps_to_eval = min(self.config.EVAL.EPISODE_COUNT, sum(self.envs.number_of_episodes))
         self.stat_eps = {}
+        self.eval_vis_eps = {}
         self.pbar = tqdm.tqdm(total=eps_to_eval) if self.config.use_pbar else None
 
         while len(self.stat_eps) < eps_to_eval:
@@ -624,6 +625,13 @@ class RLTrainer(BaseVLNCETrainer):
         )
         with open(fname, "w") as f:
             json.dump(self.stat_eps, f, indent=2)
+
+        vis_fname = os.path.join(
+            self.config.RESULTS_DIR,
+            f"eval_vis_ep_ckpt_{checkpoint_index}_{split}_r{self.local_rank}_w{self.world_size}.json",
+        )
+        with open(vis_fname, "w") as f:
+            json.dump(self.eval_vis_eps, f, indent=2)
 
         if self.local_rank < 1:
             if self.config.EVAL.SAVE_RESULTS:
@@ -1004,6 +1012,20 @@ class RLTrainer(BaseVLNCETrainer):
                     metric['sdtw'] = metric['ndtw'] * metric['success']
                     metric['ghost_cnt'] = self.gmaps[i].ghost_cnt
                     self.stat_eps[ep_id] = metric
+                    headings = info['position'].get('heading', [0.0] * len(pred_path))
+                    pred_steps = []
+                    for pi, (pos, heading) in enumerate(zip(pred_path.tolist(), headings)):
+                        pred_steps.append({
+                            'position': pos,
+                            'heading': float(heading),
+                            'stop': pi == len(pred_path) - 1,
+                        })
+                    self.eval_vis_eps[str(ep_id)] = {
+                        'pred_path': pred_steps,
+                        'gt_path': gt_path.tolist(),
+                        'goal_position': gt_path[-1].tolist(),
+                        'metrics': metric,
+                    }
                     self.pbar.update()
 
             # record path

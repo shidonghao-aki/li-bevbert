@@ -41,20 +41,26 @@ class Position(Measure):
         return self.cls_uuid
 
     def reset_metric(self, episode, *args: Any, **kwargs: Any):
-        self._metric = {'distance':[], 'position':[]}
+        self._metric = {'distance':[], 'position':[], 'heading':[]}
         self.update_metric(episode)
 
     def update_metric(self, episode, *args: Any, **kwargs: Any):
-        current_position = self._sim.get_agent_state().position
+        agent_state = self._sim.get_agent_state()
+        current_position = agent_state.position
         if len(self._metric['position']) > 0:
             if (current_position == self._metric['position'][-1]).all():
                 return
+        heading_vector = quaternion_rotate_vector(
+            agent_state.rotation.inverse(), np.array([0, 0, -1])
+        )
+        heading = cartesian_to_polar(-heading_vector[2], heading_vector[0])[1]
         distance = self._sim.geodesic_distance(
             current_position,
             [goal.position for goal in episode.goals],
             episode,
         )
-        self._metric['position'].append(self._sim.get_agent_state().position)
+        self._metric['position'].append(agent_state.position)
+        self._metric['heading'].append(heading)
         self._metric['distance'].append(distance)
 
 
