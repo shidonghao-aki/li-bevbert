@@ -16,7 +16,9 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -40,6 +42,7 @@ from visualize_result.viz_io import (
     load_episode_index,
     load_gt_index,
     load_preds,
+    make_topdown_unavailable,
     merge_gt_into_episode,
     parse_scan_id_from_scene,
     resolve_scene_path,
@@ -55,6 +58,60 @@ def log_msg(message: str) -> None:
         print(message.encode("ascii", "ignore").decode("ascii"))
 
 
+def render_habitat_topdown_subprocess(
+    scene_path: str,
+    traj: List[dict],
+    episode_meta: Optional[dict],
+    output_path: str,
+    gpu_id: int,
+    timeout_sec: int = 120,
+) -> bool:
+    """把 Habitat topdown 放到子进程，避免 C++ segfault 杀掉主渲染流程。"""
+    request = {
+        "scene_path": scene_path,
+        "traj": traj,
+        "episode_meta": episode_meta,
+        "output_path": output_path,
+        "gpu_id": gpu_id,
+    }
+    req_fd, req_path = tempfile.mkstemp(prefix="topdown_request_", suffix=".json")
+    os.close(req_fd)
+    try:
+        with open(req_path, "w", encoding="utf-8") as f:
+            json.dump(request, f)
+        cmd = [
+            sys.executable,
+            "-m",
+            "visualize_result.render_topdown_worker",
+            "--request",
+            req_path,
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=os.getcwd(),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            log_msg("[warn] Habitat topdown worker timed out")
+            return False
+        if proc.returncode != 0:
+            log_msg("[warn] Habitat topdown worker failed with code %s" % proc.returncode)
+            if stderr:
+                log_msg(stderr.decode("utf-8", "ignore")[-1000:])
+            return False
+        return os.path.isfile(output_path)
+    finally:
+        try:
+            os.remove(req_path)
+        except OSError:
+            pass
+
+
 def render_one_episode(
     renderer: HabitatTrajectoryRenderer,
     episode_id: str,
@@ -68,6 +125,7 @@ def render_one_episode(
     save_frames: bool,
     save_render_video: bool,
     topdown_mode: str,
+    gpu_id: int,
 ) -> str:
     if episode_meta is not None:
         scene_path = resolve_scene_path(
@@ -98,8 +156,9 @@ def render_one_episode(
                 - np.array(goal_position, dtype=np.float32)
             )
         )
-    topdown_source = "plain"
-    if topdown_mode in ["habitat", "auto"]:
+    topdown_source = "habitat_subprocess"
+    topdown_tmp_path = os.path.join(ep_out, "_topdown_habitat_raw.png")
+    if topdown_mode == "habitat":
         try:
             topdown_full, topdown_pixels = draw_habitat_topdown(
                 renderer.sim,
@@ -109,12 +168,33 @@ def render_one_episode(
             )
             topdown_source = "habitat"
         except Exception as ex:
-            if topdown_mode == "habitat":
-                raise
-            log_msg(f"[warn] {episode_id}: Habitat topdown failed; fallback to plain map: {ex}")
-            topdown_full, topdown_pixels = draw_topdown(traj)
+            raise
+    elif topdown_mode == "auto":
+        ok = render_habitat_topdown_subprocess(
+            scene_path,
+            traj,
+            episode_meta,
+            topdown_tmp_path,
+            gpu_id=gpu_id,
+        )
+        if ok:
+            topdown_full = cv2.imread(topdown_tmp_path, cv2.IMREAD_COLOR)
+            pixels_path = topdown_tmp_path + ".pixels.json"
+            if os.path.isfile(pixels_path):
+                with open(pixels_path, "r", encoding="utf-8") as f:
+                    topdown_pixels = [tuple(p) for p in json.load(f)]
+            else:
+                topdown_pixels = []
+            topdown_source = "habitat_subprocess"
+        else:
+            topdown_full, topdown_pixels = make_topdown_unavailable(
+                episode_id, scan_id, message="Habitat topdown failed"
+            )
+            topdown_source = "habitat_failed"
     else:
-        topdown_full, topdown_pixels = draw_topdown(traj)
+        log_msg("[warn] --topdown_mode plain is a debug-only x-z projection, not Habitat/Matterport rendered topdown")
+        topdown_full, topdown_pixels = draw_topdown(traj, episode_meta=episode_meta)
+        topdown_source = "plain"
 
     frames_render_bgr: List[np.ndarray] = []
     frames_panel_bgr: List[np.ndarray] = []
@@ -139,8 +219,10 @@ def render_one_episode(
             frames_render_bgr.append(bgr)
 
         topdown_now = topdown_full.copy()
-        for p in topdown_pixels[: t + 1]:
-            cv2.circle(topdown_now, p, 4, (0, 0, 0), -1)
+        if topdown_pixels:
+            for p in topdown_pixels[: t + 1]:
+                cv2.circle(topdown_now, p, 4, (0, 0, 0), -1)
+            cv2.circle(topdown_now, topdown_pixels[min(t, len(topdown_pixels) - 1)], 7, (0, 0, 0), -1)
         th, tw = rgb.shape[0], rgb.shape[1]
         topdown_resized = cv2.resize(topdown_now, (tw, th))
 
@@ -251,7 +333,7 @@ def main() -> None:
         "--topdown_mode",
         choices=["auto", "habitat", "plain"],
         default="auto",
-        help="auto/habitat 使用 Habitat 可通行区域地图；plain 为原始白底 x-z 投影",
+        help="auto 在子进程中生成 Habitat topdown；habitat 为进程内调试；plain 仅为 x-z 投影调试",
     )
     args = p.parse_args()
     if not args.dataset and not args.force_scene:
@@ -325,6 +407,7 @@ def main() -> None:
                     save_frames=args.save_frames,
                     save_render_video=args.save_render_video,
                     topdown_mode=args.topdown_mode,
+                    gpu_id=args.gpu_id,
                 )
                 log_msg(f"[ok] {eid} -> {out}")
             except Exception as ex:

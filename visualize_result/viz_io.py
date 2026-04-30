@@ -121,28 +121,56 @@ def resolve_scene_path(
 
 
 def draw_topdown(
-    traj: List[dict], size: int = 800, margin: int = 40, line_bgr: Tuple[int, int, int] = (0, 0, 255)
+    traj: List[dict],
+    size: int = 800,
+    margin: int = 40,
+    line_bgr: Tuple[int, int, int] = (0, 0, 255),
+    episode_meta: Optional[dict] = None,
 ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
-    """Habitat 俯视图: x–z 平面, y 为高度。"""
+    """安全版 topdown: 用 Habitat x-z 平面投影，避免调用可能崩溃的 C++ pathfinder map。"""
     pts = np.array([s["position"] for s in traj], dtype=np.float32)
-    xs, zs = pts[:, 0], pts[:, 2]
+    gt_path = extract_gt_path(episode_meta)
+    goal_pos = extract_goal_position(episode_meta)
+
+    all_pts = [pts]
+    if gt_path:
+        all_pts.append(np.array(gt_path, dtype=np.float32))
+    if goal_pos is not None:
+        all_pts.append(np.array([goal_pos], dtype=np.float32))
+    bounds_pts = np.concatenate(all_pts, axis=0)
+
+    xs, zs = bounds_pts[:, 0], bounds_pts[:, 2]
     min_x, max_x = float(xs.min()), float(xs.max())
     min_z, max_z = float(zs.min()), float(zs.max())
     span_x = max(max_x - min_x, 1e-3)
     span_z = max(max_z - min_z, 1e-3)
 
-    canvas = np.ones((size, size, 3), dtype=np.uint8) * 255
-    pixels: List[Tuple[int, int]] = []
-    for x, z in zip(xs, zs):
+    def project(pos):
+        x, z = float(pos[0]), float(pos[2])
         px = margin + int((x - min_x) / span_x * (size - 2 * margin))
         py = margin + int((z - min_z) / span_z * (size - 2 * margin))
-        pixels.append((px, py))
+        return px, py
+
+    canvas = np.ones((size, size, 3), dtype=np.uint8) * 255
+    cv2.putText(canvas, "Pred", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+    cv2.putText(canvas, "GT" if gt_path else "GT N/A", (16, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+
+    gt_pixels = [project(p) for p in gt_path]
+    for a, b in zip(gt_pixels[:-1], gt_pixels[1:]):
+        cv2.line(canvas, a, b, (255, 0, 0), 3)
+    if gt_pixels:
+        cv2.circle(canvas, gt_pixels[0], 7, (0, 180, 0), 2)
+        cv2.circle(canvas, gt_pixels[-1], 9, (255, 0, 0), 2)
+
+    pixels: List[Tuple[int, int]] = [project(p) for p in pts]
 
     for a, b in zip(pixels[:-1], pixels[1:]):
         cv2.line(canvas, a, b, line_bgr, 3)
     if pixels:
         cv2.circle(canvas, pixels[0], 8, (0, 255, 0), -1)
         cv2.circle(canvas, pixels[-1], 8, (0, 0, 255), -1)
+    if goal_pos is not None:
+        cv2.circle(canvas, project(goal_pos), 11, (255, 0, 255), 2)
     return canvas, pixels
 
 
@@ -299,6 +327,22 @@ def add_instruction_panel(
         cv2.putText(panel, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
 
     return np.concatenate([image_bgr, panel], axis=1)
+
+
+def make_topdown_unavailable(
+    episode_id: str,
+    scan_id: str,
+    size: int = 800,
+    message: str = "Habitat topdown failed",
+) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+    """明确的失败占位图；不伪装成坐标投影 topdown。"""
+    canvas = np.zeros((size, size, 3), dtype=np.uint8)
+    cv2.putText(canvas, message, (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(canvas, "Episode: %s" % episode_id, (40, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    cv2.putText(canvas, "Scan: %s" % scan_id, (40, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    cv2.putText(canvas, "First-person Habitat render is still valid.", (40, 235), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+    cv2.putText(canvas, "Use --topdown_mode habitat to debug in-process.", (40, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+    return canvas, []
 
 
 def draw_habitat_topdown(
